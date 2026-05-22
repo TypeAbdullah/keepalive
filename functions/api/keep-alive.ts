@@ -32,11 +32,13 @@ const LANGUAGE = 'en-US';
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Generates Gofile's dynamic HMAC security token
+ * Generates Gofile's dynamic HMAC security token.
+ * The wt token is derived from: SHA256(userAgent + "::" + lang + "::" + token + "::" + timeSlot + "::" + salt)
+ * Time slot rotates every 4 hours (14400 seconds). Salt may need updating if Gofile rotates it.
  */
 async function generateWT(token: string): Promise<string> {
   const t4 = Math.floor(Date.now() / 1000 / 14400);
-  const salt = 'gf2026x'; 
+  const salt = 'gf2026x';
   const data = `${USER_AGENT}::${LANGUAGE}::${token}::${t4}::${salt}`;
 
   const msgBuffer = new TextEncoder().encode(data);
@@ -46,60 +48,93 @@ async function generateWT(token: string): Promise<string> {
 }
 
 /**
- * Creates an anonymous guest token
+ * Creates an anonymous guest token from Gofile's accounts API.
  */
 async function fetchGuestToken(): Promise<string> {
   const response = await fetch('https://api.gofile.io/accounts', {
     method: 'POST',
-    headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' },
+    headers: {
+      'User-Agent': USER_AGENT,
+      'Accept': 'application/json',
+    },
   });
+
+  if (!response.ok) {
+    throw new Error(`Gofile accounts API returned HTTP ${response.status}`);
+  }
+
   const data = (await response.json()) as any;
   if (data.status === 'ok') return data.data.token;
-  throw new Error('Gofile guest account creation failed');
+  throw new Error(`Gofile guest account creation failed: ${JSON.stringify(data)}`);
 }
 
 /**
- * Fetch with an exponential backoff retry mechanism
+ * Fetch with exponential backoff retry.
+ * Retries on 429 (rate limit) and 5xx (transient server errors).
+ * Returns the response and how many attempts were made.
  */
-async function fetchWithRetry(url: string, options: RequestInit, retries = 3, backoff = 500): Promise<Response> {
-  try {
-    const response = await fetch(url, options);
-    if (response.ok || response.status === 206) return response;
-    
-    // Retry on standard rate-limit (429) or transient server failures (5xx)
-    if ((response.status === 429 || response.status >= 500) && retries > 0) {
-      await delay(backoff);
-      return fetchWithRetry(url, options, retries - 1, backoff * 2);
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries = 3,
+  backoff = 500
+): Promise<{ response: Response; attempts: number }> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+
+      // Success or a non-retryable error — return immediately
+      if (response.ok || response.status === 206) {
+        return { response, attempts: attempt };
+      }
+
+      // Retryable statuses: 429 and 5xx
+      if (response.status === 429 || response.status >= 500) {
+        if (attempt < maxRetries) {
+          await delay(backoff * Math.pow(2, attempt - 1));
+          continue;
+        }
+        // Exhausted retries — return the last response as-is
+        return { response, attempts: attempt };
+      }
+
+      // Non-retryable HTTP error (e.g. 404, 403) — return immediately
+      return { response, attempts: attempt };
+
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await delay(backoff * Math.pow(2, attempt - 1));
+      }
     }
-    return response;
-  } catch (err) {
-    if (retries > 0) {
-      await delay(backoff);
-      return fetchWithRetry(url, options, retries - 1, backoff * 2);
-    }
-    throw err;
   }
+
+  // All attempts threw network errors
+  throw lastError ?? new Error(`fetchWithRetry failed after ${maxRetries} attempts`);
 }
 
 /**
- * Main logical function that recursively scans and pings Gofile content
+ * Recursively scans all folders and pings every file with a 1-byte Range request,
+ * resetting Gofile's 30-day inactivity timer at minimal bandwidth cost.
  */
 async function processKeepAlive(
-  rootFolderId: string, 
-  token: string, 
-  wt: string, 
+  rootFolderId: string,
+  token: string,
+  wt: string,
   options: { delayMs: number }
 ): Promise<{ stats: KeepAliveStats; filesProcessed: GofileFileResult[] }> {
-  
+
   const startTime = Date.now();
   const filesProcessed: GofileFileResult[] = [];
-  
+
   let totalFoldersProcessed = 0;
   let totalBytesProcessed = 0;
   let totalSuccessfulPings = 0;
   let totalFailedPings = 0;
 
-  // Track visited folders to prevent infinite loops (if circular symlinks are ever introduced)
+  // Visited set prevents infinite loops in case of circular references
   const visitedFolders = new Set<string>();
   const folderQueue: string[] = [rootFolderId];
 
@@ -107,57 +142,80 @@ async function processKeepAlive(
     const currentFolderId = folderQueue.shift()!;
     if (visitedFolders.has(currentFolderId)) continue;
     visitedFolders.add(currentFolderId);
-    
+
     totalFoldersProcessed++;
 
     const folderUrl = `https://api.gofile.io/contents/${currentFolderId}?contentFilter=&page=1&pageSize=1000&sortField=name&sortDirection=1`;
-    const res = await fetch(folderUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent': USER_AGENT,
-        'Authorization': `Bearer ${token}`,
-        'X-Website-Token': wt,
-        'Accept-Language': LANGUAGE,
-      },
-    });
 
-    const body = (await res.json()) as any;
-    if (body.status !== 'ok') continue; // Skip failed folder queries
+    let folderRes: Response;
+    try {
+      const result = await fetchWithRetry(folderUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': USER_AGENT,
+          'Authorization': `Bearer ${token}`,
+          'X-Website-Token': wt,
+          'Accept-Language': LANGUAGE,
+        },
+      });
+      folderRes = result.response;
+    } catch (err) {
+      console.error(`Failed to fetch folder ${currentFolderId}:`, err);
+      continue;
+    }
 
-    const children = body.data.children;
-    if (!children) continue;
+    let body: any;
+    try {
+      body = await folderRes.json();
+    } catch {
+      console.error(`Failed to parse JSON for folder ${currentFolderId}`);
+      continue;
+    }
+
+    if (body.status !== 'ok') {
+      // Log auth failures so they surface in Cloudflare's real-time function logs
+      console.warn(`Folder ${currentFolderId} returned non-ok status: "${body.status}" — message: "${body.message ?? 'none'}"`);
+      continue;
+    }
+
+    const children = body.data?.children;
+    if (!children || typeof children !== 'object') continue;
 
     for (const key of Object.keys(children)) {
       const child = children[key];
 
-      // If it's a nested subfolder, push to queue to crawl it
       if (child.type === 'folder') {
+        // Queue subfolder for recursive processing
         folderQueue.push(child.id);
-      } 
-      // If it's a file, perform the simulated download
-      else if (child.type === 'file' && child.link) {
-        const fileSize = child.size || 0;
+
+      } else if (child.type === 'file' && child.link) {
+        const fileSize: number = child.size || 0;
         totalBytesProcessed += fileSize;
 
-        await delay(options.delayMs); // Throttling delay
+        // Throttle requests to avoid hammering Gofile's CDN
+        await delay(options.delayMs);
 
         let pingStatus = 500;
         let success = false;
-        let attempts = 1;
+        let attempts = 0;
 
         try {
-          const startTimePing = Date.now();
-          const pingRes = await fetchWithRetry(child.link, {
-            method: 'GET',
-            headers: {
-              'User-Agent': USER_AGENT,
-              'Range': 'bytes=0-0', // Download exactly 1 byte
-            },
-          });
-          
+          const { response: pingRes, attempts: pingAttempts } = await fetchWithRetry(
+            child.link,
+            {
+              method: 'GET',
+              headers: {
+                'User-Agent': USER_AGENT,
+                'Range': 'bytes=0-0', // Download exactly 1 byte to reset the inactivity timer
+              },
+            }
+          );
+
+          attempts = pingAttempts;
           pingStatus = pingRes.status;
           success = pingRes.ok || pingRes.status === 206;
-        } catch {
+        } catch (err) {
+          console.error(`Ping failed for file ${child.name} (${child.id}):`, err);
           success = false;
         }
 
@@ -181,9 +239,9 @@ async function processKeepAlive(
 
   const elapsedTimeMs = Date.now() - startTime;
   const totalFilesProcessed = filesProcessed.length;
-  
-  // 1 byte was downloaded per successful file, rest of file size is "bandwidth saved"
-  const bandwidthSavedBytes = totalBytesProcessed - (totalSuccessfulPings * 1);
+
+  // Only 1 byte downloaded per successful ping; the rest of the file size counts as saved bandwidth
+  const bandwidthSavedBytes = totalBytesProcessed - totalSuccessfulPings;
 
   return {
     stats: {
@@ -200,13 +258,13 @@ async function processKeepAlive(
 }
 
 /**
- * Pages Function Handler
+ * Cloudflare Pages Function handler for POST /api/keep-alive
  */
 export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async (context) => {
   const { request, env, waitUntil } = context;
 
   try {
-    // 1. Optional API Token Check
+    // 1. Optional Bearer token auth guard
     const secretToken = env.API_ACCESS_TOKEN;
     if (secretToken) {
       const authHeader = request.headers.get('Authorization');
@@ -218,33 +276,53 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
       }
     }
 
-    // 2. Parse request parameters
-    const body = (await request.json()) as any;
-    const { url, token: customToken, webhookUrl, delayMs = 200 } = body;
-
-    if (!url) {
-      return new Response(JSON.stringify({ error: 'Missing parameter "url"' }), {
+    // 2. Parse and validate request body
+    let body: any;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response(JSON.stringify({ error: 'Request body must be valid JSON' }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    const match = url.match(/(?:\/d\/)?([a-zA-Z0-9_-]+)$/);
+    const { url, token: customToken, webhookUrl, delayMs = 200 } = body;
+
+    if (!url || typeof url !== 'string') {
+      return new Response(JSON.stringify({ error: 'Missing or invalid parameter "url"' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Extract folder ID from a full URL (e.g. https://gofile.io/d/AbC123) or a bare ID
+    const match = url.trim().match(/(?:\/d\/)?([a-zA-Z0-9_-]+)$/);
     const contentId = match ? match[1] : null;
 
     if (!contentId) {
-      return new Response(JSON.stringify({ error: 'Invalid Gofile URL' }), {
+      return new Response(JSON.stringify({ error: 'Could not extract a valid Gofile folder ID from the provided URL' }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    const token = customToken || (await fetchGuestToken());
+    // Obtain a guest token if a custom one wasn't supplied
+    let token: string;
+    try {
+      token = customToken || (await fetchGuestToken());
+    } catch (err: any) {
+      return new Response(JSON.stringify({ error: `Failed to obtain Gofile token: ${err.message}` }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
     const wt = await generateWT(token);
 
-    // Mode A: Async Execution (If Webhook is provided)
-    if (webhookUrl) {
-      // Execute the task asynchronously inside the background execution thread
+    // ── Mode A: Asynchronous (webhook provided) ────────────────────────────────
+    if (webhookUrl && typeof webhookUrl === 'string') {
+
       waitUntil(
         (async () => {
           let payload: WebhookPayload;
@@ -264,7 +342,6 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
             };
           }
 
-          // Deliver results payload to the designated Webhook URL
           try {
             await fetch(webhookUrl, {
               method: 'POST',
@@ -272,7 +349,7 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
               body: JSON.stringify(payload),
             });
           } catch (webhookErr) {
-            console.error('Webhook payload delivery failed:', webhookErr);
+            console.error('Webhook delivery failed:', webhookErr);
           }
         })()
       );
@@ -287,7 +364,7 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
       );
     }
 
-    // Mode B: Synchronous Execution (Returns output inside HTTP response directly)
+    // ── Mode B: Synchronous (returns result directly) ─────────────────────────
     const results = await processKeepAlive(contentId, token, wt, { delayMs });
     return new Response(JSON.stringify({ status: 'success', data: results }), {
       status: 200,
@@ -295,7 +372,7 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
     });
 
   } catch (err: any) {
-    return new Response(JSON.stringify({ error: err.message }), {
+    return new Response(JSON.stringify({ error: err.message ?? 'Internal server error' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
     });
