@@ -9,10 +9,16 @@ interface PixeldrainListResponse {
   }>;
 }
 
+interface PingResult {
+  success: boolean;
+  status: number;
+  errorDetails?: string;
+}
+
 /**
- * Pings a single Pixeldrain file using stream cancellation to save bandwidth
+ * Pings a single Pixeldrain file and extracts diagnostic error details on failure
  */
-async function pingSingleFile(fileId: string, apiKey?: string): Promise<{ success: boolean; status: number }> {
+async function pingSingleFile(fileId: string, apiKey?: string): Promise<PingResult> {
   const targetUrl = `https://pixeldrain.com/api/file/${fileId}`;
   
   const headers: Record<string, string> = {
@@ -28,30 +34,41 @@ async function pingSingleFile(fileId: string, apiKey?: string): Promise<{ succes
   }
 
   try {
-    // Request standard GET (no Range header to avoid CDN blocks)
     const response = await fetch(targetUrl, {
       method: 'GET',
       headers: headers,
     });
 
-    let success = false;
     if (response.ok) {
-      success = true;
-      
-      // Smart Stream Cancellation: abort downloading immediately after the first chunk is read
+      // Smart Stream Cancellation: cancel immediately after registering the download hit
       if (response.body) {
         const reader = response.body.getReader();
         try {
-          await reader.read(); // Read exactly one chunk to register the download
+          await reader.read();
         } finally {
-          await reader.cancel(); // Cancel stream and close socket instantly
+          await reader.cancel();
         }
       }
+      return { success: true, status: response.status };
     }
 
-    return { success, status: response.status };
-  } catch {
-    return { success: false, status: 500 };
+    // Try to extract the error payload from Pixeldrain on 403 or other failures
+    let errorDetails = 'No specific error message returned by Pixeldrain.';
+    try {
+      const errJson = (await response.json()) as any;
+      if (errJson && errJson.message) {
+        errorDetails = errJson.message;
+      } else if (errJson && errJson.value) {
+        errorDetails = errJson.value;
+      }
+    } catch {
+      // Response was not JSON
+    }
+
+    return { success: false, status: response.status, errorDetails };
+
+  } catch (err: any) {
+    return { success: false, status: 500, errorDetails: err.message };
   }
 }
 
@@ -82,7 +99,6 @@ export const onRequestPost: PagesFunction<{
       });
     }
 
-    // Determine if URL is a file, or a List/Album
     const isList = url.includes('/l/') || url.includes('/api/list/');
     const match = url.match(/(?:\/u\/|\/file\/|\/l\/|\/list\/)?([a-zA-Z0-9_-]+)$/);
     const contentId = match ? match[1] : null;
@@ -120,6 +136,7 @@ export const onRequestPost: PagesFunction<{
           name: file.name,
           success: pingResult.success,
           status: pingResult.status,
+          error: pingResult.errorDetails,
         });
       }
 
@@ -138,14 +155,20 @@ export const onRequestPost: PagesFunction<{
     // --- CASE B: Handle Single File ---
     const pingResult = await pingSingleFile(contentId, apiKey);
 
+    const responsePayload: any = {
+      status: pingResult.success ? 'success' : 'failed',
+      service: 'pixeldrain',
+      type: 'single-file-processing',
+      fileId: contentId,
+      statusCode: pingResult.status,
+    };
+
+    if (!pingResult.success) {
+      responsePayload.error = pingResult.errorDetails;
+    }
+
     return new Response(
-      JSON.stringify({
-        status: pingResult.success ? 'success' : 'failed',
-        service: 'pixeldrain',
-        type: 'single-file-processing',
-        fileId: contentId,
-        statusCode: pingResult.status,
-      }),
+      JSON.stringify(responsePayload),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
 
