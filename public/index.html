@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gofile Link Keep-Alive Dashboard</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: #0f172a;
+      color: #e2e8f0;
+      padding: 40px 20px;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    h1 { color: #f8fafc; font-size: 24px; margin-bottom: 8px; }
+    p { color: #94a3b8; font-size: 14px; margin-top: 0; }
+    .card {
+      background-color: #1e293b;
+      padding: 24px;
+      border-radius: 12px;
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 14px; }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      background-color: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 14px;
+      box-sizing: border-box;
+      margin-bottom: 16px;
+    }
+    button {
+      background-color: #2563eb;
+      color: white;
+      border: none;
+      padding: 12px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      width: 100%;
+      transition: background 0.2s;
+    }
+    button:hover { background-color: #1d4ed8; }
+    #result {
+      white-space: pre-wrap;
+      font-family: monospace;
+      font-size: 12px;
+      background-color: #0f172a;
+      padding: 16px;
+      border-radius: 6px;
+      border: 1px solid #334155;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Gofile Link Saver Panel</h1>
+  <p>Trigger activity checks to update the 30-day inactivity timer on Gofile folders.</p>
+
+  <div class="card">
+    <label for="url">Gofile Link or Folder ID</label>
+    <input type="text" id="url" placeholder="https://gofile.io/d/AbC123" required>
+
+    <label for="token">Optional Bearer Token (If API is locked)</label>
+    <input type="text" id="token" placeholder="Your API Secret">
+
+    <button onclick="pingFolder()">Ping Folder Contents</button>
+  </div>
+
+  <pre id="result"></pre>
+
+  <script>
+    async function pingFolder() {
+      const urlInput = document.getElementById('url').value.trim();
+      const apiToken = document.getElementById('token').value.trim();
+      const resultBox = document.getElementById('result');
+
+      if (!urlInput) {
+        alert('Please enter a Gofile Link or Folder ID');
+        return;
+      }
+
+      resultBox.style.display = 'block';
+      resultBox.textContent = 'Processing files, please wait...';
+
+      const headers = { 'Content-Type': 'application/json' };
+      if (apiToken) {
+        headers['Authorization'] = `Bearer ${apiToken}`;
+      }
+
+      try {
+        const response = await fetch('/api/keep-alive', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ url: urlInput })
+        });
+
+        const data = await response.json();
+        resultBox.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        resultBox.textContent = 'Network error: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
