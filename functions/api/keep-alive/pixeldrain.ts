@@ -1,8 +1,63 @@
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+interface PixeldrainListResponse {
+  id: string;
+  files: Array<{
+    id: string;
+    name: string;
+    size: number;
+  }>;
+}
+
+/**
+ * Pings a single Pixeldrain file using stream cancellation to save bandwidth
+ */
+async function pingSingleFile(fileId: string, apiKey?: string): Promise<{ success: boolean; status: number }> {
+  const targetUrl = `https://pixeldrain.com/api/file/${fileId}`;
+  
+  const headers: Record<string, string> = {
+    'User-Agent': USER_AGENT,
+    'Origin': 'https://pixeldrain.com',
+    'Referer': `https://pixeldrain.com/u/${fileId}`,
+    'Accept': '*/*',
+  };
+
+  if (apiKey) {
+    const credentials = btoa(`:${apiKey}`);
+    headers['Authorization'] = `Basic ${credentials}`;
+  }
+
+  try {
+    // Request standard GET (no Range header to avoid CDN blocks)
+    const response = await fetch(targetUrl, {
+      method: 'GET',
+      headers: headers,
+    });
+
+    let success = false;
+    if (response.ok) {
+      success = true;
+      
+      // Smart Stream Cancellation: abort downloading immediately after the first chunk is read
+      if (response.body) {
+        const reader = response.body.getReader();
+        try {
+          await reader.read(); // Read exactly one chunk to register the download
+        } finally {
+          await reader.cancel(); // Cancel stream and close socket instantly
+        }
+      }
+    }
+
+    return { success, status: response.status };
+  } catch {
+    return { success: false, status: 500 };
+  }
+}
+
 export const onRequestPost: PagesFunction<{ 
   API_ACCESS_TOKEN?: string;
-  PIXELDRAIN_API_KEY?: string; // Add your free Pixeldrain API Key here
+  PIXELDRAIN_API_KEY?: string;
 }> = async (context) => {
   try {
     const { request, env } = context;
@@ -27,58 +82,73 @@ export const onRequestPost: PagesFunction<{
       });
     }
 
-    const match = url.match(/(?:\/u\/|\/file\/)?([a-zA-Z0-9_-]+)$/);
-    const fileId = match ? match[1] : null;
+    // Determine if URL is a file, or a List/Album
+    const isList = url.includes('/l/') || url.includes('/api/list/');
+    const match = url.match(/(?:\/u\/|\/file\/|\/l\/|\/list\/)?([a-zA-Z0-9_-]+)$/);
+    const contentId = match ? match[1] : null;
 
-    if (!fileId) {
+    if (!contentId) {
       return new Response(JSON.stringify({ error: 'Invalid Pixeldrain URL or ID' }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    const targetUrl = `https://pixeldrain.com/api/file/${fileId}`;
-    
-    // Set up request headers with browser impersonation
-    const headers: Record<string, string> = {
-      'User-Agent': USER_AGENT,
-      'Range': 'bytes=0-0',
-      'Origin': 'https://pixeldrain.com',
-      'Referer': `https://pixeldrain.com/u/${fileId}`,
-      'Accept': '*/*',
-    };
-
-    // If a Pixeldrain API Key is configured, authenticate via Basic Auth
     const apiKey = env.PIXELDRAIN_API_KEY;
-    if (apiKey) {
-      // Pixeldrain expects Basic Auth with empty username and API key as password
-      const credentials = btoa(`:${apiKey}`);
-      headers['Authorization'] = `Basic ${credentials}`;
+    const filesProcessed: any[] = [];
+
+    // --- CASE A: Handle Album/List ---
+    if (isList) {
+      const listUrl = `https://pixeldrain.com/api/list/${contentId}`;
+      const listRes = await fetch(listUrl, {
+        headers: apiKey ? { 'Authorization': `Basic ${btoa(':' + apiKey)}` } : {}
+      });
+
+      if (!listRes.ok) {
+        return new Response(JSON.stringify({ error: `Failed to fetch Pixeldrain list. Status: ${listRes.status}` }), {
+          status: 502,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      const listData = (await listRes.json()) as PixeldrainListResponse;
+      
+      for (const file of listData.files) {
+        const pingResult = await pingSingleFile(file.id, apiKey);
+        filesProcessed.push({
+          id: file.id,
+          name: file.name,
+          success: pingResult.success,
+          status: pingResult.status,
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: 'success',
+          service: 'pixeldrain',
+          type: 'list-processing',
+          listId: contentId,
+          filesProcessed,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
     }
 
-    const pingResponse = await fetch(targetUrl, {
-      method: 'GET',
-      headers: headers,
-    });
-
-    const success = pingResponse.ok || pingResponse.status === 206;
-
-    // If it still returns a 403, advise the user to provide an API key
-    let message = undefined;
-    if (pingResponse.status === 403 && !apiKey) {
-      message = "Pixeldrain returned 403. This is commonly caused by shared serverless IP limits. To fix this, create a free Pixeldrain account and add PIXELDRAIN_API_KEY to your Cloudflare env settings.";
-    }
+    // --- CASE B: Handle Single File ---
+    const pingResult = await pingSingleFile(contentId, apiKey);
 
     return new Response(
       JSON.stringify({
-        status: success ? 'success' : 'failed',
+        status: pingResult.success ? 'success' : 'failed',
         service: 'pixeldrain',
-        fileId,
-        statusCode: pingResponse.status,
-        message,
+        type: 'single-file-processing',
+        fileId: contentId,
+        statusCode: pingResult.status,
       }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
+
   } catch (err: any) {
     return new Response(JSON.stringify({ error: err.message }), {
       status: 500,
