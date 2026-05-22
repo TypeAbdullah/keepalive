@@ -1,6 +1,9 @@
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async (context) => {
+export const onRequestPost: PagesFunction<{ 
+  API_ACCESS_TOKEN?: string;
+  PIXELDRAIN_API_KEY?: string; // Add your free Pixeldrain API Key here
+}> = async (context) => {
   try {
     const { request, env } = context;
 
@@ -24,7 +27,6 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
       });
     }
 
-    // Extract Pixeldrain file ID
     const match = url.match(/(?:\/u\/|\/file\/)?([a-zA-Z0-9_-]+)$/);
     const fileId = match ? match[1] : null;
 
@@ -35,17 +37,37 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
       });
     }
 
-    // Ping the file using 1-byte Range request
     const targetUrl = `https://pixeldrain.com/api/file/${fileId}`;
+    
+    // Set up request headers with browser impersonation
+    const headers: Record<string, string> = {
+      'User-Agent': USER_AGENT,
+      'Range': 'bytes=0-0',
+      'Origin': 'https://pixeldrain.com',
+      'Referer': `https://pixeldrain.com/u/${fileId}`,
+      'Accept': '*/*',
+    };
+
+    // If a Pixeldrain API Key is configured, authenticate via Basic Auth
+    const apiKey = env.PIXELDRAIN_API_KEY;
+    if (apiKey) {
+      // Pixeldrain expects Basic Auth with empty username and API key as password
+      const credentials = btoa(`:${apiKey}`);
+      headers['Authorization'] = `Basic ${credentials}`;
+    }
+
     const pingResponse = await fetch(targetUrl, {
       method: 'GET',
-      headers: {
-        'User-Agent': USER_AGENT,
-        'Range': 'bytes=0-0',
-      },
+      headers: headers,
     });
 
     const success = pingResponse.ok || pingResponse.status === 206;
+
+    // If it still returns a 403, advise the user to provide an API key
+    let message = undefined;
+    if (pingResponse.status === 403 && !apiKey) {
+      message = "Pixeldrain returned 403. This is commonly caused by shared serverless IP limits. To fix this, create a free Pixeldrain account and add PIXELDRAIN_API_KEY to your Cloudflare env settings.";
+    }
 
     return new Response(
       JSON.stringify({
@@ -53,6 +75,7 @@ export const onRequestPost: PagesFunction<{ API_ACCESS_TOKEN?: string }> = async
         service: 'pixeldrain',
         fileId,
         statusCode: pingResponse.status,
+        message,
       }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
