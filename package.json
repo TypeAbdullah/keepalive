@@ -1,0 +1,11 @@
+{
+  "name": "gofile-keepalive-pages",
+  "version": "1.0.0",
+  "description": "Cloudflare Pages implementation of Gofile Keep-Alive API",
+  "scripts": {
+    "dev": "wrangler pages dev public"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
